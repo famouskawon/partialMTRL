@@ -2,7 +2,7 @@ import abc
 import time
 from collections import deque
 from typing import Deque, Generic, Self, TypeVar, override
-
+import jax
 import numpy as np
 import numpy.typing as npt
 import orbax.checkpoint as ocp
@@ -37,6 +37,7 @@ from metaworld_algorithms.types import (
     ReplayBufferSamples,
     RNNState,
     Rollout,
+    PrioritizedReplayBatch
 )
 
 AlgorithmConfigType = TypeVar("AlgorithmConfigType", bound=AlgorithmConfig)
@@ -46,6 +47,49 @@ MetaLearningTrainingConfigType = TypeVar(
     "MetaLearningTrainingConfigType", bound=MetaLearningTrainingConfig
 )
 DataType = TypeVar("DataType", ReplayBufferSamples, Rollout, list[Rollout])
+
+
+import os, json
+import numpy as np
+from datetime import datetime
+
+def save_buffer_npz(path: str, replay_buffer, meta: dict):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    ckpt = replay_buffer.checkpoint()
+    payload = {}
+    for k, v in ckpt["data"].items():
+        payload[f"data/{k}"] = v
+    payload["rng_state_json"] = np.array(json.dumps(ckpt["rng_state"]), dtype=object)
+    meta = dict(meta)
+    meta["saved_at"] = datetime.now().isoformat()
+    payload["meta_json"] = np.array(json.dumps(meta), dtype=object)
+    np.savez_compressed(path, **payload)
+SNAP_EVERY = 200_000  # total_steps 기준
+
+def probe_sample_per_task(replay_buffer, rng: np.random.Generator, k_per_task: int):
+    # valid size
+    size = replay_buffer.capacity if replay_buffer.full else replay_buffer.pos
+    T = replay_buffer.num_tasks
+
+    buf_idx = []
+    task_idx = []
+    obs = []
+    act = []
+
+    for t in range(T):
+        idx = rng.integers(0, size, size=(k_per_task,), dtype=np.int32)
+        buf_idx.append(idx)
+        task_idx.append(np.full((k_per_task,), t, dtype=np.int32))
+        obs.append(replay_buffer.obs[idx, t])
+        act.append(replay_buffer.actions[idx, t])
+
+    buf_idx = np.concatenate(buf_idx, axis=0)
+    task_idx = np.concatenate(task_idx, axis=0)
+    obs = np.concatenate(obs, axis=0)
+    act = np.concatenate(act, axis=0)
+    return buf_idx, task_idx, obs, act
+
+
 
 
 class Algorithm(
@@ -530,6 +574,39 @@ class RNNBasedMetaLearningAlgorithm(
 
         return self
 
+def make_top20_mask_per_task(q_score: np.ndarray, task_idx: np.ndarray, num_tasks: int, top_p: float = 0.2):
+    thr = np.empty((num_tasks,), dtype=np.float32)
+    mask = np.zeros_like(q_score, dtype=bool)
+    q = q_score.astype(np.float32)
+
+    for t in range(num_tasks):
+        m = (task_idx == t)
+        if not np.any(m):
+            thr[t] = np.nan
+            continue
+        thr[t] = np.quantile(q[m], 1.0 - top_p)
+        mask[m] = (q[m] >= thr[t])
+    return mask, thr
+
+
+def save_probe_npz(path: str, buf_idx, task_idx, q_score, is_top, xyz, thr, meta: dict):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    np.savez_compressed(
+        path,
+        buf_idx=buf_idx.astype(np.int32),
+        task_idx=task_idx.astype(np.int32),
+        q_score=q_score.astype(np.float32),
+        is_top=is_top.astype(np.uint8),
+        xyz=xyz.astype(np.float32),
+        thr=thr.astype(np.float32),
+        meta_json=np.array(json.dumps(meta), dtype=object),
+    )
+
+PROBE_EVERY = 50_000
+K_PER_TASK = 1024
+TOP_P = 0.2
+XYZ_IDXS = (0, 1, 2)  # <- 네 obs에서 x,y,z 위치로 바꿔야 함
+
 
 class OffPolicyAlgorithm(
     Algorithm[
@@ -537,13 +614,17 @@ class OffPolicyAlgorithm(
     ],
     Generic[AlgorithmConfigType],
 ):
+
+    @abc.abstractmethod
+    def q_min(self, obs:np.ndarray, act:np.ndarray) -> np.ndarray: ...
+
     @abc.abstractmethod
     def spawn_replay_buffer(
         self, env_config: EnvConfig, config: OffPolicyTrainingConfig, seed: int = 1
     ) -> AbstractReplayBuffer: ...
 
     @abc.abstractmethod
-    def update(self, data: ReplayBufferSamples) -> tuple[Self, LogDict]: ...
+    def update(self, data: ReplayBufferSamples) -> tuple[Self, LogDict, npt.NDArray]: ...
 
     @abc.abstractmethod
     def sample_action(self, observation: Observation) -> tuple[Self, Action]: ...
@@ -573,6 +654,17 @@ class OffPolicyAlgorithm(
 
         obs, _ = envs.reset()
 
+        # ============================
+        # Success Episode Accumulator
+        # ============================
+        # env index 별로 현재 에피소드 trajectory를 누적한다.
+        ep_obs = [[] for _ in range(envs.num_envs)]
+        ep_next_obs = [[] for _ in range(envs.num_envs)]
+        ep_actions = [[] for _ in range(envs.num_envs)]
+        ep_rewards = [[] for _ in range(envs.num_envs)]
+        ep_dones = [[] for _ in range(envs.num_envs)]
+
+
         done = np.full((envs.num_envs,), False)
         start_step, episodes_ended = 0, 0
 
@@ -596,12 +688,23 @@ class OffPolicyAlgorithm(
 
             next_obs, rewards, terminations, truncations, infos = envs.step(actions)
             done = np.logical_or(terminations, truncations)
-
+        
             buffer_obs = next_obs
             if "final_obs" in infos:
                 buffer_obs = np.where(
                     done[:, None], np.stack(infos["final_obs"]), next_obs
                 )
+
+            # ============================
+            # Accumulate full episode transitions (per env)
+            # ============================
+            for i in range(envs.num_envs):
+                ep_obs[i].append(obs[i].copy())
+                ep_next_obs[i].append(buffer_obs[i].copy())
+                ep_actions[i].append(actions[i].copy())
+                ep_rewards[i].append(float(rewards[i]))
+                ep_dones[i].append(bool(done[i]))
+
             replay_buffer.add(obs, buffer_obs, actions, rewards, done)
 
             obs = next_obs
@@ -616,10 +719,55 @@ class OffPolicyAlgorithm(
                     )
                     episodes_ended += 1
 
+                    finfo = infos["final_info"]
+                    success_i = float(finfo["success"][i]) if "success" in finfo else 0.0
+                    ep_o_last = ep_obs[i][-1]
+                    task_onehot = ep_o_last[-self.num_tasks:]
+                    task_idx = int(np.argmax(task_onehot))
+                    # (A) success episode 저장
+                    if success_i >= 1.0:
+                        ep_o = np.asarray(ep_obs[i])
+                        ep_no = np.asarray(ep_next_obs[i])
+                        ep_a = np.asarray(ep_actions[i])
+                        ep_r = np.asarray(ep_rewards[i], dtype=np.float32)
+                        ep_d = np.asarray(ep_dones[i], dtype=np.bool_)
+
+                        task_onehot = ep_o[-1, -self.num_tasks:]
+                        task_idx = int(np.argmax(task_onehot))
+
+                        if hasattr(replay_buffer, "add_success_episode"):
+                            replay_buffer.add_success_episode(
+                                observations=ep_o,
+                                next_observations=ep_no,
+                                actions=ep_a,
+                                rewards=ep_r,
+                                dones=ep_d,
+                                task_idx=task_idx,
+                            )
+                    # (B) success EMA 업데이트 (기존 코드 유지하되 success_i 재사용)
+                    if hasattr(replay_buffer, "update_success_ema"):
+                        task_success = np.zeros(self.num_tasks)
+                        mask = np.zeros(self.num_tasks, dtype=bool)
+
+                        # ⚠️ 여기 아직 env i == task i 가정이 들어있음.
+                        # 일단 그대로 두되, 나중에 task_idx로 바꾸는 게 더 안전함.
+                        task_success[task_idx] = success_i
+                        mask[task_idx] = True
+
+                        replay_buffer.update_success_ema(task_success, mask=mask)
+
+                    # (C) episode accumulator clear
+                    ep_obs[i].clear()
+                    ep_next_obs[i].clear()
+                    ep_actions[i].clear()
+                    ep_rewards[i].clear()
+                    ep_dones[i].clear()
+
             if global_step % 500 == 0 and global_episodic_return:
                 print(
                     f"global_step={total_steps}, mean_episodic_return={np.mean(list(global_episodic_return))}"
                 )
+
                 if track:
                     log(
                         {
@@ -636,16 +784,92 @@ class OffPolicyAlgorithm(
             if global_step > config.warmstart_steps:
                 # Update the agent with data
                 data = replay_buffer.sample(config.batch_size)
-                self, logs = self.update(data)
+                success_ema = replay_buffer.success_ema if hasattr(replay_buffer, "success_ema") else None
+                il_data = None
+                il_shared_data = None
+                if (
+                    hasattr(replay_buffer, "success_ready")
+                    and hasattr(replay_buffer, "sample_success")
+                    and replay_buffer.success_ready(min_size=256)
+                ):
+                    il_data = replay_buffer.sample_success(batch_size=256)
+                    
+                # shared overlap 샘플 (버퍼에서 이미 "겹치는 것만" 뽑힘)
+                if hasattr(replay_buffer, "sample_success_shared"):
+                    # shared 비율은 일단 128 정도로 시작 (256의 절반)
+                    il_shared_data, _, _ = replay_buffer.sample_success_shared(
+                        batch_size=128,
+                        min_tasks=2,   # MT10은 2, MT50도 2~3부터
+                        )
+
+                if isinstance(data, PrioritizedReplayBatch):
+                    self, logs, td_errs = self.update(
+                        data.samples,
+                        success_ema=success_ema,
+                        il_data=il_data,
+                        il_shared_data=il_shared_data,  
+                    )
+                    td_errs_np = np.asarray(jax.device_get(td_errs)).reshape(-1)
+                    replay_buffer.update_td_priorities(data.buf_idx, data.task_idx, td_errs_np)
+                else:
+                    self, logs, _ = self.update(
+                        data,
+                        success_ema=success_ema,
+                        il_data=il_data,
+                        il_shared_data=il_shared_data,
+                    )
+                
+                if (total_steps % SNAP_EVERY) == 0 and total_steps > 0:
+                    save_buffer_npz(
+                        f"buffer_snaps/buffer_step{total_steps:08d}.npz",
+                        replay_buffer,
+                        meta={"total_steps": int(total_steps), "seed": int(seed)},
+                    )
+                if (total_steps % PROBE_EVERY) == 0 and total_steps > 0 and global_step > config.warmstart_steps:
+                    rng = np.random.default_rng(seed + total_steps)  # step-dependent, 재현 가능
+                    buf_idx, task_idx, ob, ac = probe_sample_per_task(replay_buffer, rng, K_PER_TASK)
+
+                    q_score = np.asarray(self.q_min(ob, ac)).reshape(-1)  # (B,)
+                    is_top, thr = make_top20_mask_per_task(q_score, task_idx, self.num_tasks, top_p=TOP_P)
+
+                    xyz = ob[:, XYZ_IDXS]  # (B,3)
+
+                    # (선택) 간단 요약 통계 (W&B에 찍기 좋음)
+                    # task별 selected vs all mean distance 같은 걸 만들어도 됨
+                    meta = {"total_steps": int(total_steps), "k_per_task": int(K_PER_TASK), "top_p": float(TOP_P)}
+
+                    save_probe_npz(
+                        f"buffer_snaps/probe_step{total_steps:08d}.npz",
+                        buf_idx, task_idx, q_score, is_top, xyz, thr, meta
+                    )
+
+                    # wandb/log에도 요약값만 올리고 싶으면:
+                    if track:
+                        # 예: 전체에서 selected 비율(항상 0.2 근처지만 task별 결측 등 체크용)
+                        log({"probe/selected_frac": float(is_top.mean())}, step=total_steps)
 
                 # Logging
                 if global_step % 100 == 0:
                     sps_steps = (global_step - start_step) * envs.num_envs
                     sps = int(sps_steps / (time.time() - start_time))
                     print("SPS:", sps)
-
                     if track:
                         log({"charts/SPS": sps} | logs, step=total_steps)
+                    if track and hasattr(replay_buffer, "update_success_ema"):
+                        ema = np.asarray(replay_buffer.success_ema).reshape(-1)
+                        p = np.asarray(replay_buffer.get_task_sampling_probs()).reshape(-1)
+
+                        metrics = {
+                            "sampling/success_ema_mean": float(ema.mean()),
+                            "sampling/success_ema_min": float(ema.min()),
+                            "sampling/success_ema_max": float(ema.max()),
+                            "sampling/p_entropy": float(-(p * np.log(p + 1e-8)).sum()),  # 샘플링이 얼마나 쏠리는지
+                        }
+                        for t in range(len(ema)):
+                            metrics[f"sampling/success_ema/t{t}"] = float(ema[t])
+                            metrics[f"sampling/task_sampling_probs/t{t}"] = float(p[t])
+
+                        log(metrics, step=total_steps)
 
                 # Evaluation
                 if (

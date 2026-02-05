@@ -1,0 +1,83 @@
+WARNING:2026-02-04 06:58:21,383:jax._src.xla_bridge:794: An NVIDIA GPU may be present on this machine, but a CUDA-enabled jaxlib is not installed. Falling back to cpu.
+WARNING:jax._src.xla_bridge:An NVIDIA GPU may be present on this machine, but a CUDA-enabled jaxlib is not installed. Falling back to cpu.
+/home/mlic/anaconda3/envs/mw_render/lib/python3.12/site-packages/orbax/checkpoint/_src/serialization/type_handlers.py:1251: UserWarning: Couldn't find sharding info under RestoreArgs. Populating sharding info from sharding file. Please note restoration time will be slightly increased due to reading from file instead of directly from RestoreArgs. Note also that this option is unsafe when restoring on a different topology than the checkpoint was saved with.
+  warnings.warn(
+ERROR:root:Device cuda:0 was not found in jax.local_devices().
+ERROR:root:Device cuda:0 was not found in jax.local_devices().
+ERROR:root:Device cuda:0 was not found in jax.local_devices().
+ERROR:root:Device cuda:0 was not found in jax.local_devices().
+ERROR:root:Device cuda:0 was not found in jax.local_devices().
+ERROR:root:Device cuda:0 was not found in jax.local_devices().
+ERROR:root:Device cuda:0 was not found in jax.local_devices().
+ERROR:root:Device cuda:0 was not found in jax.local_devices().
+ERROR:root:Device cuda:0 was not found in jax.local_devices().
+ERROR:root:Device cuda:0 was not found in jax.local_devices().
+ERROR:root:Device cuda:0 was not found in jax.local_devices().
+ERROR:root:Device cuda:0 was not found in jax.local_devices().
+ERROR:root:Device cuda:0 was not found in jax.local_devices().
+ERROR:root:Device cuda:0 was not found in jax.local_devices().
+ERROR:root:Device cuda:0 was not found in jax.local_devices().
+ERROR:root:Device cuda:0 was not found in jax.local_devices().
+ERROR:root:Device cuda:0 was not found in jax.local_devices().
+ERROR:root:Device cuda:0 was not found in jax.local_devices().
+ERROR:root:Device cuda:0 was not found in jax.local_devices().
+ERROR:root:Device cuda:0 was not found in jax.local_devices().
+ERROR:root:Device cuda:0 was not found in jax.local_devices().
+ERROR:root:Device cuda:0 was not found in jax.local_devices().
+ERROR:root:Device cuda:0 was not found in jax.local_devices().
+ERROR:root:Device cuda:0 was not found in jax.local_devices().
+ERROR:root:Device cuda:0 was not found in jax.local_devices().
+ERROR:root:Device cuda:0 was not found in jax.local_devices().
+ERROR:root:Device cuda:0 was not found in jax.local_devices().
+ERROR:root:Device cuda:0 was not found in jax.local_devices().
+ERROR:root:Device cuda:0 was not found in jax.local_devices().
+ERROR:root:Device cuda:0 was not found in jax.local_devices().
+ERROR:root:Device cuda:0 was not found in jax.local_devices().
+ERROR:root:Device cuda:0 was not found in jax.local_devices().
+ERROR:root:Device cuda:0 was not found in jax.local_devices().
+ERROR:root:Device cuda:0 was not found in jax.local_devices().
+ERROR:root:Device cuda:0 was not found in jax.local_devices().
+ERROR:root:Device cuda:0 was not found in jax.local_devices().
+ERROR:root:Device cuda:0 was not found in jax.local_devices().
+ERROR:root:Device cuda:0 was not found in jax.local_devices().
+ERROR:root:Device cuda:0 was not found in jax.local_devices().
+ERROR:root:Device cuda:0 was not found in jax.local_devices().
+ERROR:root:Device cuda:0 was not found in jax.local_devices().
+ERROR:root:Device cuda:0 was not found in jax.local_devices().
+ERROR:root:Device cuda:0 was not found in jax.local_devices().
+ERROR:root:Device cuda:0 was not found in jax.local_devices().
+ERROR:root:Device cuda:0 was not found in jax.local_devices().
+ERROR:root:Device cuda:0 was not found in jax.local_devices().
+ERROR:root:Device cuda:0 was not found in jax.local_devices().
+ERROR:root:Device cuda:0 was not found in jax.local_devices().
+ERROR:root:Device cuda:0 was not found in jax.local_devices().
+ERROR:root:Device cuda:0 was not found in jax.local_devices().
+ERROR:root:Device cuda:0 was not found in jax.local_devices().
+ERROR:root:Device cuda:0 was not found in jax.local_devices().
+ERROR:root:Device cuda:0 was not found in jax.local_devices().
+ERROR:root:Device cuda:0 was not found in jax.local_devices().
+ERROR:root:Device cuda:0 was not found in jax.local_devices().
+ERROR:root:Device cuda:0 was not found in jax.local_devices().
+ERROR:root:Device cuda:0 was not found in jax.local_devices().
+ERROR:root:Device cuda:0 was not found in jax.local_devices().
+ERROR:root:Device cuda:0 was not found in jax.local_devices().
+ERROR:root:Device cuda:0 was not found in jax.local_devices().
+ERROR:root:Device cuda:0 was not found in jax.local_devices().
+ERROR:root:Device cuda:0 was not found in jax.local_devices().
+ERROR:root:Device cuda:0 was not found in jax.local_devices().
+ERROR:root:Device cuda:0 was not found in jax.local_devices().
+ERROR:root:Device cuda:0 was not found in jax.local_devices().
+ERROR:root:Device cuda:0 was not found in jax.local_devices().
+ERROR:root:Device cuda:0 was not found in jax.local_devices().
+
+JAX Version: 0.6.2
+JAX Devices: [CpuDevice(id=0)]
+Orbax Version: 0.11.11
+Initializing Agent...
+Agent initialized.
+Restoring from: /home/mlic/kawon/251222_metaworld/metaworld-algorithms/examples/multi_task/run_results8/mt10_custom_mtsac_1/checkpoints/9599990/agent
+Attempting basic restore with item=agent...
+Basic restore failed: sharding passed to deserialization should be specified, concrete and an instance of `jax.sharding.Sharding`. Got None
+Attempting restore with explicit restore_args for sharding...
+Success with explicit restore_args!
+

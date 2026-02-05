@@ -81,6 +81,8 @@ class MetaworldConfig(EnvConfig):
 
         if self.use_one_hot:
             num_tasks = 1
+            if self.env_id == "MT2":
+                num_tasks = 2
             if self.env_id == "MT10":
                 num_tasks = 10
             if self.env_id == "MT25":

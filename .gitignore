@@ -177,3 +177,32 @@ flake.nix
 flake.lock
 
 run_results/
+
+
+# env
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# experiments / logs
+wandb/
+**/run_results*/
+**/checkpoints*/
+**/*.orbax-checkpoint-tmp-*/
+**/buffer_snaps/
+**/*.wandb
+
+# artifacts
+*.gif
+*.mp4
+*.npz
+*.npy
+
+# OS/editor
+.DS_Store
+.vscode/
+.idea/
+
+examples/multi_task/260203_buffer_snaps/
+examples/multi_task/Metaworld/
