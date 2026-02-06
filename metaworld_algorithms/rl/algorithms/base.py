@@ -786,7 +786,7 @@ class OffPolicyAlgorithm(
                 data = replay_buffer.sample(config.batch_size)
                 success_ema = replay_buffer.success_ema if hasattr(replay_buffer, "success_ema") else None
                 il_data = None
-                il_shared_data = None
+                # il_shared_data = None
                 if (
                     hasattr(replay_buffer, "success_ready")
                     and hasattr(replay_buffer, "sample_success")
@@ -794,13 +794,13 @@ class OffPolicyAlgorithm(
                 ):
                     il_data = replay_buffer.sample_success(batch_size=256)
                     
-                # shared overlap 샘플 (버퍼에서 이미 "겹치는 것만" 뽑힘)
-                if hasattr(replay_buffer, "sample_success_shared"):
-                    # shared 비율은 일단 128 정도로 시작 (256의 절반)
-                    il_shared_data, _, _ = replay_buffer.sample_success_shared(
-                        batch_size=128,
-                        min_tasks=2,   # MT10은 2, MT50도 2~3부터
-                        )
+                # # shared overlap 샘플 (버퍼에서 이미 "겹치는 것만" 뽑힘)
+                # if hasattr(replay_buffer, "sample_success_shared"):
+                #     # shared 비율은 일단 128 정도로 시작 (256의 절반)
+                #     il_shared_data, _, _ = replay_buffer.sample_success_shared(
+                #         batch_size=128,
+                #         min_tasks=2,   # MT10은 2, MT50도 2~3부터
+                #         )
 
                 if isinstance(data, PrioritizedReplayBatch):
                     self, logs, td_errs = self.update(

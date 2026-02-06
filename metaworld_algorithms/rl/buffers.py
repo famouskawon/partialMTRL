@@ -500,7 +500,7 @@ class InterTaskMultiTaskReplayBuffer(MultiTaskReplayBuffer):
 
         # InterTaskMultiTaskReplayBuffer.__init__ 내부 (success buffer 초기화 이후에 추가)
         # ---- Shared overlap (LSH on obs) ----
-        self.use_shared_overlap_il = True  # config flag (원하면 인자로 빼도 됨)
+        self.use_shared_overlap_il = False  # config flag (원하면 인자로 빼도 됨)
 
         # LSH params
         self.lsh_bits = 24                 # 16~32 추천. 24면 충돌/희소 밸런스 좋음.
@@ -597,18 +597,6 @@ class InterTaskMultiTaskReplayBuffer(MultiTaskReplayBuffer):
             if self.suc_pos >= self.suc_capacity:
                 self.suc_full = True
                 self.suc_pos = 0
-
-        # InterTaskMultiTaskReplayBuffer.add_success_episode의 for t in range(T): 안쪽
-        # 1) compute hash for shared-overlap
-        if self.use_shared_overlap_il:
-            h = self._lsh_hash_obs(obs[t])
-            self.suc_hash[i] = h
-
-            # 2) update global hash -> task mask
-            key = int(h)  # dict key는 int로
-            prev = self._hash_task_mask.get(key, 0)
-            self._hash_task_mask[key] = prev | (1 << int(task_idx))
-
         
 
     def success_ready(self, min_size: int) -> bool:
