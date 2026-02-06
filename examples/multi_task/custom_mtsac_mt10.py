@@ -21,9 +21,9 @@ class Args:
     track: bool = False
     wandb_project: str | None = None
     wandb_entity: str | None = None
-    data_dir: Path = Path("./run_results9")
+    data_dir: Path = Path("./run_results/Q-filter-top-p-0625")
     resume: bool = False
-
+    q_filter_top_p: float = 0.625
 
 def main() -> None:
     args = tyro.cli(Args)
@@ -60,6 +60,7 @@ def main() -> None:
             il_weight_power=2.0,        # minmax용
             il_loss_type="mse",
             il_coef=1.0,
+            il_qfilter_top_p=args.q_filter_top_p
 
         ),
         training_config=OffPolicyTrainingConfig(

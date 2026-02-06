@@ -807,7 +807,6 @@ class OffPolicyAlgorithm(
                         data.samples,
                         success_ema=success_ema,
                         il_data=il_data,
-                        il_shared_data=il_shared_data,  
                     )
                     td_errs_np = np.asarray(jax.device_get(td_errs)).reshape(-1)
                     replay_buffer.update_td_priorities(data.buf_idx, data.task_idx, td_errs_np)
@@ -816,7 +815,6 @@ class OffPolicyAlgorithm(
                         data,
                         success_ema=success_ema,
                         il_data=il_data,
-                        il_shared_data=il_shared_data,
                     )
                 
                 if (total_steps % SNAP_EVERY) == 0 and total_steps > 0:
