@@ -29,7 +29,7 @@ def main() -> None:
     args = tyro.cli(Args)
 
     run = Run(
-        run_name="mt10_custom_mtsac",
+        run_name=(f"mt10_custom_mtsac"f"_q_filter_top_p_{args.q_filter_top_p}"),
         seed=args.seed,
         data_dir=args.data_dir,
         env=MetaworldConfig(
