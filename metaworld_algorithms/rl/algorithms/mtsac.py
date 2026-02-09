@@ -5,7 +5,7 @@ MTSAC (JAX/Flax) with PyTorch(SB3)-style 2-step RL+IL update:
   1) SAC critic update
   2) SAC actor (RL-only) update
   3) alpha update (from RL actor log_probs)
-  4) extra BC-only actor update (success-based IL), Q-filtered top-p
+  4) extra BC-only actor update (success-based IL), filtered (Q or Advantage)
 """
 
 import dataclasses
@@ -130,10 +130,25 @@ class MTSACConfig(AlgorithmConfig):
     # BC loss type + scaling
     il_loss_type: str = "mse"         # "mse" | "nll"
     il_coef: float = 1.0
-    il_qfilter_top_p: float = 0.2
-    il_qfilter_min_good: int = 8
 
-    # MTSACConfig에 추가
+    # ------------------------------------------------------------
+    # IL filtering: compare Q-filter vs Advantage-filter
+    # ------------------------------------------------------------
+    # "q"       : score = min(Q)(s,a_data), keep top-p
+    # "adv"     : score = A(s,a)=Q(s,a)-V(s), keep top-p
+    # "adv_pos" : keep only A>0 (fallback to top-p if too few)
+    # "none"    : no filtering
+    il_filter_mode: str = "adv_pos"         # "q" | "adv" | "adv_pos" | "none"
+
+    # advantage type:
+    # "sac"   : V(s)=Q(s,a_pi)-alpha*logpi(a_pi|s)
+    # "simple": V(s)=Q(s,a_pi)
+    il_adv_type: str = "sac"          # "sac" | "simple"
+
+    il_filter_top_p: float = 0.2
+    il_filter_min_good: int = 8
+
+    # Shared (kept as your current)
     il_use_shared: bool = False
     il_shared_coef: float = 1.0
     il_shared_min_tasks: int = 2
@@ -171,8 +186,15 @@ class MTSAC(OffPolicyAlgorithm[MTSACConfig]):
     il_weight_power: float = struct.field(pytree_node=False)
     il_loss_type: str = struct.field(pytree_node=False)
     il_coef: float = struct.field(pytree_node=False)
-    il_qfilter_top_p: float = struct.field(pytree_node=False)
-    il_qfilter_min_good: int = struct.field(pytree_node=False)
+
+    # NEW: filter settings
+    il_filter_mode: str = struct.field(pytree_node=False)
+    il_adv_type: str = struct.field(pytree_node=False)
+    il_filter_top_p: float = struct.field(pytree_node=False)
+    il_filter_min_good: int = struct.field(pytree_node=False)
+
+    # shared coef (may be set externally; keep getattr usage)
+    # il_shared_coef: float = struct.field(pytree_node=False)  # optional in your codebase
 
     success_ema: jax.Array  # stored for convenience; typically updated in trainer/buffer logic
 
@@ -243,8 +265,10 @@ class MTSAC(OffPolicyAlgorithm[MTSACConfig]):
             il_loss_type=config.il_loss_type,
             il_coef=config.il_coef,
             success_ema=jnp.zeros(config.num_tasks),
-            il_qfilter_top_p=config.il_qfilter_top_p,
-            il_qfilter_min_good=config.il_qfilter_min_good,
+            il_filter_mode=config.il_filter_mode,
+            il_adv_type=config.il_adv_type,
+            il_filter_top_p=config.il_filter_top_p,
+            il_filter_min_good=config.il_filter_min_good,
         )
 
     # ---------------- replay buffer ----------------
@@ -424,13 +448,12 @@ class MTSAC(OffPolicyAlgorithm[MTSACConfig]):
         return self.replace(critic=critic, key=key), logs, td_errs
 
     # ============================================================
-    # IL lambda (kept as your current; can switch to PyTorch-minmax later)
+    # IL lambda
     # ============================================================
     def compute_il_lambda_from_success_ema(self, success_ema: jax.Array, task_onehot: jax.Array) -> jax.Array:
         task_idx = jnp.argmax(task_onehot, axis=1)
         s = success_ema[task_idx].reshape(-1, 1)
-        lam = 2.0 * jnp.clip(s, 0.0, 1.0)   # (S0=0,S1=1,LAMBDA_MAX=2)랑 동치
-        # lam = jax.nn.sigmoid(s / self.il_weight_temp)
+        lam = 2.0 * jnp.clip(s, 0.0, 1.0)   # (S0=0,S1=1,LAMBDA_MAX=2)
         return lam
 
     # ============================================================
@@ -474,7 +497,6 @@ class MTSAC(OffPolicyAlgorithm[MTSACConfig]):
             actor_loss_value = loss_values.mean()
             log_probs, rl_losses = aux_values  # each has leading task dim
             flat_grads, _ = flatten_util.ravel_pytree(jax.tree.map(lambda x: x.mean(axis=0), actor_grads))
-
             rl_loss_scalar = rl_losses.mean()
         else:
             (actor_loss_value, (log_probs, rl_loss_scalar)), actor_grads = jax.value_and_grad(
@@ -499,11 +521,6 @@ class MTSAC(OffPolicyAlgorithm[MTSACConfig]):
         return self.replace(actor=actor, key=key), log_probs, logs
 
     def q_min(self, obs: np.ndarray, act: np.ndarray) -> np.ndarray:
-        """
-        obs: (B, obs_dim) numpy
-        act: (B, act_dim) numpy
-        returns: (B,) numpy  (min over ensemble critics)
-        """
         obs_j = jnp.asarray(obs)
         act_j = jnp.asarray(act)
         q_ens = self.critic.apply_fn(self.critic.params, obs_j, act_j)  # (N,B,1)
@@ -512,7 +529,6 @@ class MTSAC(OffPolicyAlgorithm[MTSACConfig]):
 
     # ============================================================
     # Actor update (IL-only BC extra step)
-    # PyTorch(SB3) style: extra actor optimizer step after SAC updates
     # ============================================================
     def update_actor_il(
         self,
@@ -521,73 +537,89 @@ class MTSAC(OffPolicyAlgorithm[MTSACConfig]):
         success_ema: jax.Array,
     ) -> tuple[Self, LogDict]:
         key, opt_key = jax.random.split(self.key)
-
-        def _bc_loss_for_batch(_il: ReplayBufferSamples, use_qfilter: bool):
-            dist_il = self.actor.apply_fn(self.actor.params, _il.observations)
-            pred = dist_il.mode()
-            per = jnp.mean((pred - _il.actions) ** 2, axis=-1, keepdims=True)  # (B,1)
-
-            il_task_onehot = _il.observations[..., -self.num_tasks:]
-            lam = self.compute_il_lambda_from_success_ema(success_ema, il_task_onehot)  # (B,1)
-
-            if not use_qfilter:
-                return jnp.mean(lam * per), {
-                    "q_thr": jnp.array(jnp.nan, dtype=per.dtype),
-                    "good_cnt": jnp.array(_il.observations.shape[0], dtype=jnp.float32),
-                    "q_mean_all": jnp.array(jnp.nan, dtype=per.dtype),
-                    "q_mean_good": jnp.array(jnp.nan, dtype=per.dtype),
-                    "lam_mean": lam.mean(),
-                }
-
-            # ---- Q-filter (specific only) ----
-            q_ens = self.critic.apply_fn(self.critic.params, _il.observations, _il.actions)  # (N,B,1)
-            q_min = jax.lax.stop_gradient(jnp.min(q_ens, axis=0)).reshape(-1)               # (B,)
-
-            thr = jnp.quantile(q_min, 1.0 - self.il_qfilter_top_p)
-            good = (q_min >= thr)
-            good_f = good.astype(per.dtype).reshape(-1, 1)
-            good_cnt = jnp.sum(good.astype(jnp.int32))
-
-            def _use_filtered(_):
-                return jnp.sum(lam * good_f * per) / (jnp.sum(good_f) + 1e-8)
-
-            def _skip(_):
-                return jnp.array(0.0, dtype=per.dtype)
-
-            loss = jax.lax.cond(good_cnt >= self.il_qfilter_min_good, _use_filtered, _skip, operand=None)
-
-            q_mean_all = q_min.mean()
-            q_mean_good = jnp.where(good, q_min, 0.0).sum() / (good_cnt + 1e-8)
-            return loss, {
-                "q_thr": thr,
-                "good_cnt": good_cnt.astype(jnp.float32),
-                "q_mean_all": q_mean_all,
-                "q_mean_good": q_mean_good,
-                "lam_mean": lam.mean(),
-            }
+        opt_key, adv_key = jax.random.split(opt_key)
 
         def total_bc_loss_fn(params: FrozenDict):
-            # NOTE: params is unused inside _bc_loss_for_batch currently; if you want strictness,
-            # pass params and use in apply_fn. Kept simple: rewrite below to use params.
-            # We'll do it properly:
-            def _bc_loss_for_batch_params(_il: ReplayBufferSamples, use_qfilter: bool):
+            def _filtered_bc_loss_for_batch(_il: ReplayBufferSamples, apply_filter: bool):
+                # BC per-sample loss (MSE on action mode)
                 dist_il = self.actor.apply_fn(params, _il.observations)
                 pred = dist_il.mode()
-                per = jnp.mean((pred - _il.actions) ** 2, axis=-1, keepdims=True)
+                per = jnp.mean((pred - _il.actions) ** 2, axis=-1, keepdims=True)  # (B,1)
 
-                il_task_onehot = _il.observations[..., -self.num_tasks:]
-                lam = self.compute_il_lambda_from_success_ema(success_ema, il_task_onehot)
+                # lambda from success EMA
+                il_task_onehot = _il.observations[..., -self.num_tasks:]  # (B,num_tasks)
+                lam = self.compute_il_lambda_from_success_ema(success_ema, il_task_onehot)  # (B,1)
 
-                if not use_qfilter:
-                    return jnp.mean(lam * per), (jnp.nan, jnp.nan, jnp.nan, _il.observations.shape[0], lam.mean())
+                # If no filter requested (shared batch default), just weighted BC
+                if (not apply_filter) or (self.il_filter_mode == "none"):
+                    loss = jnp.mean(lam * per)
+                    # (thr, mean_all, mean_good, good_cnt, lam_mean)
+                    return loss, (jnp.nan, jnp.nan, jnp.nan, jnp.array(_il.observations.shape[0], jnp.float32), lam.mean())
 
-                q_ens = self.critic.apply_fn(self.critic.params, _il.observations, _il.actions)
-                q_min = jax.lax.stop_gradient(jnp.min(q_ens, axis=0)).reshape(-1)
+                # ------------------------------------------------------------
+                # score base: Q(s, a_data)
+                # ------------------------------------------------------------
+                q_ens_data = self.critic.apply_fn(self.critic.params, _il.observations, _il.actions)  # (N,B,1)
+                q_data = jnp.min(q_ens_data, axis=0).reshape(-1)  # (B,)
+                q_data = jax.lax.stop_gradient(q_data)
 
-                thr = jnp.quantile(q_min, 1.0 - self.il_qfilter_top_p)
-                good = (q_min >= thr)
-                good_f = good.astype(per.dtype).reshape(-1, 1)
+                # ------------------------------------------------------------
+                # score: Q or Advantage
+                # ------------------------------------------------------------
+                if self.il_filter_mode == "q":
+                    score = q_data
+                else:
+                    # sample a_pi ~ pi(.|s)
+                    dist_pi = self.actor.apply_fn(params, _il.observations)
+
+                    if self.il_adv_type == "simple":
+                        a_pi = dist_pi.sample(seed=adv_key)
+                        q_ens_pi = self.critic.apply_fn(self.critic.params, _il.observations, a_pi)  # (N,B,1)
+                        q_pi = jnp.min(q_ens_pi, axis=0).reshape(-1)
+                        q_pi = jax.lax.stop_gradient(q_pi)
+                        score = jax.lax.stop_gradient(q_data - q_pi)
+                    else:
+                        a_pi, logp_pi = dist_pi.sample_and_log_prob(seed=adv_key)
+                        logp_pi = logp_pi.reshape(-1)
+
+                        q_ens_pi = self.critic.apply_fn(self.critic.params, _il.observations, a_pi)  # (N,B,1)
+                        q_pi = jnp.min(q_ens_pi, axis=0).reshape(-1)
+                        q_pi = jax.lax.stop_gradient(q_pi)
+
+                        alpha_il = self.alpha.apply_fn(self.alpha.params, il_task_onehot).reshape(-1)  # (B,)
+                        v_s = q_pi - alpha_il * logp_pi
+                        score = jax.lax.stop_gradient(q_data - v_s)  # advantage
+
+                # ------------------------------------------------------------
+                # mask from score
+                # ------------------------------------------------------------
+                if self.il_filter_mode in ("q", "adv"):
+                    thr = jnp.quantile(score, 1.0 - self.il_filter_top_p)
+                    good = (score >= thr)
+                elif self.il_filter_mode == "adv_pos":
+                    # primary: A>0
+                    thr = jnp.array(0.0, dtype=score.dtype)
+                    good = (score > 0.0)
+                else:
+                    thr = jnp.array(jnp.nan, dtype=score.dtype)
+                    good = jnp.ones_like(score, dtype=bool)
+
                 good_cnt = jnp.sum(good.astype(jnp.int32))
+
+                # adv_pos fallback: if too few positives, fall back to top-p
+                if self.il_filter_mode == "adv_pos":
+                    def _fallback_top_p(_):
+                        thr2 = jnp.quantile(score, 1.0 - self.il_filter_top_p)
+                        good2 = (score >= thr2)
+                        return thr2, good2
+
+                    def _keep_pos(_):
+                        return thr, good
+
+                    thr, good = jax.lax.cond(good_cnt >= self.il_filter_min_good, _keep_pos, _fallback_top_p, operand=None)
+                    good_cnt = jnp.sum(good.astype(jnp.int32))
+
+                good_f = good.astype(per.dtype).reshape(-1, 1)
 
                 def _use(_):
                     return jnp.sum(lam * good_f * per) / (jnp.sum(good_f) + 1e-8)
@@ -595,23 +627,25 @@ class MTSAC(OffPolicyAlgorithm[MTSACConfig]):
                 def _skip(_):
                     return jnp.array(0.0, dtype=per.dtype)
 
-                loss = jax.lax.cond(good_cnt >= self.il_qfilter_min_good, _use, _skip, operand=None)
-                q_mean_all = q_min.mean()
-                q_mean_good = jnp.where(good, q_min, 0.0).sum() / (good_cnt + 1e-8)
-                return loss, (thr, q_mean_all, q_mean_good, good_cnt.astype(jnp.float32), lam.mean())
+                loss = jax.lax.cond(good_cnt >= self.il_filter_min_good, _use, _skip, operand=None)
+
+                score_mean_all = score.mean()
+                score_mean_good = jnp.where(good, score, 0.0).sum() / (good_cnt + 1e-8)
+
+                return loss, (thr, score_mean_all, score_mean_good, good_cnt.astype(jnp.float32), lam.mean())
 
             loss_sp = jnp.array(0.0, dtype=jnp.float32)
             loss_sh = jnp.array(0.0, dtype=jnp.float32)
 
-            # logs
-            sp_stats = (jnp.nan, jnp.nan, jnp.nan, jnp.array(0.0), jnp.array(0.0))
-            sh_stats = (jnp.nan, jnp.nan, jnp.nan, jnp.array(0.0), jnp.array(0.0))
+            sp_stats = (jnp.nan, jnp.nan, jnp.nan, jnp.array(0.0, jnp.float32), jnp.array(0.0, jnp.float32))
+            sh_stats = (jnp.nan, jnp.nan, jnp.nan, jnp.array(0.0, jnp.float32), jnp.array(0.0, jnp.float32))
 
             if il_data is not None:
-                loss_sp, sp_stats = _bc_loss_for_batch_params(il_data, use_qfilter=True)
+                loss_sp, sp_stats = _filtered_bc_loss_for_batch(il_data, apply_filter=True)
 
             if il_shared_data is not None:
-                loss_sh, sh_stats = _bc_loss_for_batch_params(il_shared_data, use_qfilter=False)
+                # keep shared as no-filter by default (same as your old code)
+                loss_sh, sh_stats = _filtered_bc_loss_for_batch(il_shared_data, apply_filter=False)
 
             total = (self.il_coef * loss_sp) + (getattr(self, "il_shared_coef", 1.0) * loss_sh)
             return total, (loss_sp, loss_sh, sp_stats, sh_stats)
@@ -625,22 +659,36 @@ class MTSAC(OffPolicyAlgorithm[MTSACConfig]):
             optimizer_extra_args={"task_losses": total_loss, "key": opt_key},
         )
 
-        (sp_thr, sp_q_all, sp_q_good, sp_good_cnt, sp_lam_mean) = sp_stats
-        (sh_thr, sh_q_all, sh_q_good, sh_good_cnt, sh_lam_mean) = sh_stats
+        (sp_thr, sp_score_all, sp_score_good, sp_good_cnt, sp_lam_mean) = sp_stats
+        (sh_thr, sh_score_all, sh_score_good, sh_good_cnt, sh_lam_mean) = sh_stats
 
         logs = {
             "il/active": jnp.array(1.0, dtype=jnp.float32),
+            "il/filter_mode": jnp.array(0.0, dtype=jnp.float32),  # placeholder numeric; log string in trainer if needed
             "il/loss_total": total_loss,
             "il/loss_specific": loss_sp,
             "il/loss_shared": loss_sh,
-            "il/spec_q_thr": sp_thr,
-            "il/spec_q_mean_all": sp_q_all,
-            "il/spec_q_mean_good": sp_q_good,
+
+            # unified "score" logs (works for both Q and Adv)
+            "il/spec_score_thr": sp_thr,
+            "il/spec_score_mean_all": sp_score_all,
+            "il/spec_score_mean_good": sp_score_good,
             "il/spec_good_cnt": sp_good_cnt,
             "il/spec_lam_mean": sp_lam_mean,
+
+            "il/shared_score_thr": sh_thr,
+            "il/shared_score_mean_all": sh_score_all,
+            "il/shared_score_mean_good": sh_score_good,
             "il/shared_cnt": sh_good_cnt,
             "il/shared_lam_mean": sh_lam_mean,
         }
+
+        # If you want explicit mode logging without string support:
+        # q=0, adv=1, adv_pos=2, none=3
+        mode_map = {"q": 0.0, "adv": 1.0, "adv_pos": 2.0, "none": 3.0}
+        logs["il/filter_mode"] = jnp.array(mode_map.get(self.il_filter_mode, -1.0), dtype=jnp.float32)
+        logs["il/adv_type"] = jnp.array(0.0 if self.il_adv_type == "sac" else 1.0, dtype=jnp.float32)
+
         return self.replace(actor=actor, key=key), logs
 
     # ============================================================
@@ -720,6 +768,7 @@ class MTSAC(OffPolicyAlgorithm[MTSACConfig]):
             self, il_logs = self.update_actor_il(il_data, il_shared_data, success_ema)
         else:
             il_logs = {"il/active": jnp.array(0.0, dtype=jnp.float32)}
+
         # PCGrad logs (kept)
         critic_optim_logs = {}
         actor_optim_logs = {}
